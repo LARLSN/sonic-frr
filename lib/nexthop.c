@@ -143,12 +143,6 @@ static int _nexthop_cmp_no_labels(const struct nexthop *next1,
 {
 	int ret = 0;
 
-	if (next1->vrf_id < next2->vrf_id)
-		return -1;
-
-	if (next1->vrf_id > next2->vrf_id)
-		return 1;
-
 	if (next1->type < next2->type)
 		return -1;
 
@@ -164,6 +158,12 @@ static int _nexthop_cmp_no_labels(const struct nexthop *next1,
 	switch (next1->type) {
 	case NEXTHOP_TYPE_IPV4:
 	case NEXTHOP_TYPE_IPV6:
+		if (next1->vrf_id < next2->vrf_id)
+			return -1;
+
+		if (next1->vrf_id > next2->vrf_id)
+			return 1;
+
 		ret = _nexthop_gateway_cmp(next1, next2);
 		if (ret != 0)
 			return ret;
@@ -865,6 +865,7 @@ void nexthop_copy_no_recurse(struct nexthop *copy,
 	memcpy(&copy->rmap_src, &nexthop->rmap_src, sizeof(nexthop->rmap_src));
 	memcpy(&copy->rmac, &nexthop->rmac, sizeof(nexthop->rmac));
 	copy->rparent = rparent;
+	memcpy(&copy->nh_encap.encap_data.rmac, &nexthop->nh_encap.encap_data.rmac, ETH_ALEN);
 	if (nexthop->nh_label)
 		nexthop_add_labels(copy, nexthop->nh_label_type,
 				   nexthop->nh_label->num_labels,

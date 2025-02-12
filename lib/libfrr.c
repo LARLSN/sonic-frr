@@ -1445,3 +1445,11 @@ void _libfrr_version(void)
 	write(1, banner, sizeof(banner) - 1);
 	_exit(0);
 }
+
+bool frr_is_daemon(void)
+{
+	if (di)
+		return true;
+
+	return false;
+}

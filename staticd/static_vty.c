@@ -27,6 +27,8 @@
 #include "static_debug.h"
 #include "staticd/static_vty_clippy.c"
 #include "static_nb.h"
+#include "static_srv6.h"
+#include "static_zebra.h"
 
 #define STATICD_STR "Static route daemon\n"
 
@@ -1201,6 +1203,183 @@ DEFPY_YANG(ipv6_route_vrf, ipv6_route_vrf_cmd,
 	return static_route_nb_run(vty, &args);
 }
 
+DEFUN_NOSH (static_segment_routing, static_segment_routing_cmd,
+      "segment-routing",
+      "Segment Routing\n")
+{
+	VTY_PUSH_CONTEXT_NULL(SEGMENT_ROUTING_NODE);
+	return CMD_SUCCESS;
+}
+
+DEFUN_NOSH (static_srv6, static_srv6_cmd,
+      "srv6",
+      "Segment Routing SRv6\n")
+{
+	VTY_PUSH_CONTEXT_NULL(SRV6_NODE);
+	return CMD_SUCCESS;
+}
+
+DEFUN_YANG_NOSH (no_static_srv6, no_static_srv6_cmd,
+      "no srv6",
+      NO_STR
+      "Segment Routing SRv6\n")
+{
+	char xpath[XPATH_MAXLEN];
+
+	snprintf(xpath, sizeof(xpath), "/frr-routing:routing/control-plane-protocols/control-plane-protocol[type='%s'][name='%s'][vrf='%s']/frr-staticd:staticd/segment-routing/srv6",
+		 "frr-staticd:staticd", "staticd", VRF_DEFAULT_NAME);
+
+	nb_cli_enqueue_change(vty, xpath, NB_OP_DESTROY, NULL);
+
+	return nb_cli_apply_changes(vty, "%s", xpath);
+}
+
+DEFUN_NOSH (static_srv6_sids, static_srv6_sids_cmd,
+      "static-sids",
+      "Segment Routing SRv6 SIDs\n")
+{
+	VTY_PUSH_CONTEXT_NULL(SRV6_SIDS_NODE);
+	return CMD_SUCCESS;
+}
+
+
+static const char *seg6local_action2yang(uint32_t action)
+{
+	switch (action) {
+	case STATIC_SRV6_SID_BEHAVIOR_UN:
+		return "un";
+	case STATIC_SRV6_SID_BEHAVIOR_UA:
+		return "ua";
+	case STATIC_SRV6_SID_BEHAVIOR_UDT6:
+		return "udt6";
+	case STATIC_SRV6_SID_BEHAVIOR_UDT4:
+		return "udt4";
+	case STATIC_SRV6_SID_BEHAVIOR_UDT46:
+		return "udt46";
+	}
+	return "unspec";
+}
+
+DEFPY_YANG(srv6_sid, srv6_sid_cmd,
+      "sid X:X::X:X/M locator NAME$locator_name behavior <uN | uDT6 vrf VIEWVRFNAME | uDT4 vrf VIEWVRFNAME | uDT46 vrf VIEWVRFNAME>",
+	  "Configure SRv6 SID\n"
+      "Specify SRv6 SID\n"
+	  "Locator name\n"
+      "Specify Locator name\n"
+      "Specify SRv6 SID behavior\n"
+      "Apply the code to a uN SID\n"
+      "Apply the code to an uDT6 SID\n"
+      "Configure VRF name\n"
+      "Specify VRF name\n"
+      "Apply the code to an uDT4 SID\n"
+      "Configure VRF name\n"
+      "Specify VRF name\n"
+      "Apply the code to an uDT46 SID\n"
+      "Configure VRF name\n"
+      "Specify VRF name\n")
+{
+	enum static_srv6_sid_behavior_t behavior = STATIC_SRV6_SID_BEHAVIOR_UNSPEC;
+	int idx = 0;
+	const char *vrf_name = NULL;
+	char xpath_sid[XPATH_MAXLEN];
+	char xpath_behavior[XPATH_MAXLEN];
+	char xpath_vrf_name[XPATH_MAXLEN];
+	char xpath_locator_name[XPATH_MAXLEN];
+
+	if (argv_find(argv, argc, "uN", &idx)) {
+		behavior = STATIC_SRV6_SID_BEHAVIOR_UN;
+	} else if (argv_find(argv, argc, "uDT6", &idx)) {
+		behavior = STATIC_SRV6_SID_BEHAVIOR_UDT6;
+		vrf_name = argv[idx + 2]->arg;
+	} else if (argv_find(argv, argc, "uDT4", &idx)) {
+		behavior = STATIC_SRV6_SID_BEHAVIOR_UDT4;
+		vrf_name = argv[idx + 2]->arg;
+	} else if (argv_find(argv, argc, "uDT46", &idx)) {
+		behavior = STATIC_SRV6_SID_BEHAVIOR_UDT46;
+		vrf_name = argv[idx + 2]->arg;
+	}
+
+	snprintf(xpath_sid, sizeof(xpath_sid), "/frr-routing:routing/control-plane-protocols/control-plane-protocol[type='%s'][name='%s'][vrf='%s']/frr-staticd:staticd/segment-routing/srv6/local-sids/sid[sid='%s']",
+		 "frr-staticd:staticd", "staticd", VRF_DEFAULT_NAME, sid_str);
+
+	snprintf(xpath_behavior, sizeof(xpath_behavior), "/frr-routing:routing/control-plane-protocols/control-plane-protocol[type='%s'][name='%s'][vrf='%s']/frr-staticd:staticd/segment-routing/srv6/local-sids/sid[sid='%s']/behavior",
+		 "frr-staticd:staticd", "staticd", VRF_DEFAULT_NAME, sid_str);
+
+	nb_cli_enqueue_change(vty, xpath_sid,
+					NB_OP_CREATE, sid_str);
+
+	nb_cli_enqueue_change(vty, xpath_behavior,
+					NB_OP_MODIFY, seg6local_action2yang(behavior));
+
+	if (vrf_name) {
+		snprintf(xpath_vrf_name, sizeof(xpath_vrf_name), "/frr-routing:routing/control-plane-protocols/control-plane-protocol[type='%s'][name='%s'][vrf='%s']/frr-staticd:staticd/segment-routing/srv6/local-sids/sid[sid='%s']/vrf-name",
+			"frr-staticd:staticd", "staticd", VRF_DEFAULT_NAME, sid_str);
+
+		nb_cli_enqueue_change(vty, xpath_vrf_name,
+						NB_OP_MODIFY, vrf_name);
+	}
+
+	if (locator_name) {
+		snprintf(xpath_locator_name, sizeof(xpath_locator_name), "/frr-routing:routing/control-plane-protocols/control-plane-protocol[type='%s'][name='%s'][vrf='%s']/frr-staticd:staticd/segment-routing/srv6/local-sids/sid[sid='%s']/locator-name",
+			"frr-staticd:staticd", "staticd", VRF_DEFAULT_NAME, sid_str);
+
+		nb_cli_enqueue_change(vty, xpath_locator_name,
+						NB_OP_MODIFY, locator_name);
+	}
+
+	return nb_cli_apply_changes(vty, "%s", xpath_sid);
+}
+
+DEFPY_YANG(no_srv6_sid, no_srv6_sid_cmd,
+      "no sid X:X::X:X/M [locator NAME$locator_name] [behavior <uN | uDT6 vrf VIEWVRFNAME | uDT4 vrf VIEWVRFNAME | uDT46 vrf VIEWVRFNAME>]",
+      NO_STR
+	  "Configure SRv6 SID\n"
+      "Specify SRv6 SID\n"
+	  "Locator name\n"
+      "Specify Locator name\n"
+      "Specify SRv6 SID behavior\n"
+      "Apply the code to a uN SID\n"
+      "Apply the code to an uDT6 SID\n"
+      "Configure VRF name\n"
+      "Specify VRF name\n"
+      "Apply the code to an uDT4 SID\n"
+      "Configure VRF name\n"
+      "Specify VRF name\n"
+      "Apply the code to an uDT46 SID\n"
+      "Configure VRF name\n"
+      "Specify VRF name\n")
+{
+	char xpath[XPATH_MAXLEN + 37];
+
+	snprintf(xpath, sizeof(xpath), "/frr-routing:routing/control-plane-protocols/control-plane-protocol[type='%s'][name='%s'][vrf='%s']/frr-staticd:staticd/segment-routing/srv6/local-sids/sid[sid='%s']",
+		 "frr-staticd:staticd", "staticd", VRF_DEFAULT_NAME, sid_str);
+
+	nb_cli_enqueue_change(vty, xpath, NB_OP_DESTROY, NULL);
+
+	return nb_cli_apply_changes(vty, NULL);
+}
+
+static struct cmd_node sr_node = {
+	.name = "sr",
+	.node = SEGMENT_ROUTING_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-sr)# ",
+};
+
+static struct cmd_node srv6_node = {
+	.name = "srv6",
+	.node = SRV6_NODE,
+	.parent_node = SEGMENT_ROUTING_NODE,
+	.prompt = "%s(config-srv6)# ",
+};
+
+static struct cmd_node srv6_sids_node = {
+	.name = "srv6-sids",
+	.node = SRV6_SIDS_NODE,
+	.parent_node = SRV6_NODE,
+	.prompt = "%s(config-srv6-sids)# ",
+};
+
 #ifdef INCLUDE_MGMTD_CMDDEFS_ONLY
 
 static void static_cli_show(struct vty *vty, const struct lyd_node *dnode,
@@ -1545,6 +1724,104 @@ static int static_path_list_cli_cmp(const struct lyd_node *dnode1,
 	return (int)distance1 - (int)distance2;
 }
 
+static void static_segment_routing_cli_show(struct vty *vty, const struct lyd_node *dnode,
+			    bool show_defaults)
+{
+	vty_out(vty, "segment-routing\n");
+}
+
+static void static_segment_routing_cli_show_end(struct vty *vty, const struct lyd_node *dnode)
+{
+	vty_out(vty, "exit\n");
+	vty_out(vty, "!\n");
+}
+
+static void static_srv6_cli_show(struct vty *vty, const struct lyd_node *dnode,
+			    bool show_defaults)
+{
+	vty_out(vty, " srv6\n");
+}
+
+static void static_srv6_cli_show_end(struct vty *vty, const struct lyd_node *dnode)
+{
+	vty_out(vty, " exit\n");
+	vty_out(vty, " !\n");
+}
+
+static void static_sids_cli_show(struct vty *vty, const struct lyd_node *dnode,
+			    bool show_defaults)
+{
+	vty_out(vty, "  static-sids\n");
+}
+
+static void static_sids_cli_show_end(struct vty *vty, const struct lyd_node *dnode)
+{
+	vty_out(vty, "  exit\n");
+	vty_out(vty, "  !\n");
+}
+
+static void srv6_sid_cli_show(struct vty *vty, const struct lyd_node *sid,
+			     bool show_defaults)
+{
+	enum static_srv6_sid_behavior_t srv6_behavior;
+	struct prefix_ipv6 sid_value;
+
+	yang_dnode_get_ipv6p(&sid_value, sid, "sid");
+
+	vty_out(vty, "   sid %pFX", &sid_value);
+	if (yang_dnode_exists(sid, "locator-name"))
+		vty_out(vty, " locator %s", yang_dnode_get_string(sid, "locator-name"));
+
+	srv6_behavior = yang_dnode_get_enum(sid, "behavior");
+	switch(srv6_behavior) {
+		case STATIC_SRV6_SID_BEHAVIOR_END:
+			vty_out(vty, " behavior End");
+			break;
+		case STATIC_SRV6_SID_BEHAVIOR_END_X:
+			vty_out(vty, " behavior End.X");
+			break;
+		case STATIC_SRV6_SID_BEHAVIOR_END_DT6:
+			vty_out(vty, " behavior End.DT6");
+			break;
+		case STATIC_SRV6_SID_BEHAVIOR_END_DT4:
+			vty_out(vty, " behavior End.DT4");
+			break;
+		case STATIC_SRV6_SID_BEHAVIOR_END_DT46:
+			vty_out(vty, " behavior End.DT46");
+			break;
+		case STATIC_SRV6_SID_BEHAVIOR_UN:
+			vty_out(vty, " behavior uN");
+			break;
+		case STATIC_SRV6_SID_BEHAVIOR_UA:
+			vty_out(vty, " behavior uA");
+			break;
+		case STATIC_SRV6_SID_BEHAVIOR_UDT6:
+			vty_out(vty, " behavior uDT6");
+			break;
+		case STATIC_SRV6_SID_BEHAVIOR_UDT4:
+			vty_out(vty, " behavior uDT4");
+			break;
+		case STATIC_SRV6_SID_BEHAVIOR_UDT46:
+			vty_out(vty, " behavior uDT46");
+			break;
+		case STATIC_SRV6_SID_BEHAVIOR_UNSPEC:
+			vty_out(vty, " behavior unknown");
+			break;
+	}
+
+	if (yang_dnode_exists(sid, "vrf-name"))
+		vty_out(vty, " vrf %s", yang_dnode_get_string(sid, "vrf-name"));
+
+	vty_out(vty, "\n");
+}
+
+static void static_srv6_sid_cli_show(struct vty *vty,
+					const struct lyd_node *dnode,
+					bool show_defaults)
+{
+	srv6_sid_cli_show(vty, dnode, show_defaults);
+}
+
 const struct frr_yang_module_info frr_staticd_cli_info = {
 	.name = "frr-staticd",
 	.ignore_cfg_cbs = true,
@@ -1592,6 +1869,33 @@ const struct frr_yang_module_info frr_staticd_cli_info = {
 			.cbs = {
 				.cli_show = static_src_nexthop_cli_show,
 				.cli_cmp = static_nexthop_cli_cmp,
+			}
+		},
+		{
+			.xpath = "/frr-routing:routing/control-plane-protocols/control-plane-protocol/frr-staticd:staticd/segment-routing",
+			.cbs = {
+				.cli_show = static_segment_routing_cli_show,
+				.cli_show_end = static_segment_routing_cli_show_end,
+			}
+		},
+		{
+			.xpath = "/frr-routing:routing/control-plane-protocols/control-plane-protocol/frr-staticd:staticd/segment-routing/srv6",
+			.cbs = {
+				.cli_show = static_srv6_cli_show,
+				.cli_show_end = static_srv6_cli_show_end,
+			}
+		},
+		{
+			.xpath = "/frr-routing:routing/control-plane-protocols/control-plane-protocol/frr-staticd:staticd/segment-routing/srv6/local-sids",
+			.cbs = {
+				.cli_show = static_sids_cli_show,
+				.cli_show_end = static_sids_cli_show_end,
+			}
+		},
+		{
+			.xpath = "/frr-routing:routing/control-plane-protocols/control-plane-protocol/frr-staticd:staticd/segment-routing/srv6/local-sids/sid",
+			.cbs = {
+				.cli_show = static_srv6_sid_cli_show,
 			}
 		},
 		{
@@ -1663,6 +1967,7 @@ void static_vty_init(void)
 	install_element(CONFIG_NODE, &debug_staticd_cmd);
 	install_element(ENABLE_NODE, &show_debugging_static_cmd);
 	install_element(ENABLE_NODE, &staticd_show_bfd_routes_cmd);
+
 #else /* else INCLUDE_MGMTD_CMDDEFS_ONLY */
 	install_element(CONFIG_NODE, &ip_mroute_dist_cmd);
 
@@ -1679,6 +1984,21 @@ void static_vty_init(void)
 	install_element(VRF_NODE, &ipv6_route_address_interface_vrf_cmd);
 	install_element(CONFIG_NODE, &ipv6_route_cmd);
 	install_element(VRF_NODE, &ipv6_route_vrf_cmd);
+
+	install_node(&sr_node);
+	install_node(&srv6_node);
+	install_node(&srv6_sids_node);
+	install_default(SEGMENT_ROUTING_NODE);
+	install_default(SRV6_NODE);
+	install_default(SRV6_SIDS_NODE);
+	
+	install_element(CONFIG_NODE, &static_segment_routing_cmd);
+	install_element(SEGMENT_ROUTING_NODE, &static_srv6_cmd);
+	install_element(SEGMENT_ROUTING_NODE, &no_static_srv6_cmd);
+	install_element(SRV6_NODE, &static_srv6_sids_cmd);
+	install_element(SRV6_SIDS_NODE, &srv6_sid_cmd);
+	install_element(SRV6_SIDS_NODE, &no_srv6_sid_cmd);
+
 #endif /* ifndef INCLUDE_MGMTD_CMDDEFS_ONLY */
 
 #ifndef INCLUDE_MGMTD_CMDDEFS_ONLY

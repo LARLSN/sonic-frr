@@ -178,6 +178,7 @@ static struct peer *peer_xfer_conn(struct peer *from_peer)
 	EVENT_OFF(going_away->t_delayopen);
 	EVENT_OFF(going_away->t_connect_check_r);
 	EVENT_OFF(going_away->t_connect_check_w);
+	EVENT_OFF(going_away->t_stop_with_notify);
 	EVENT_OFF(keeper->t_routeadv);
 	EVENT_OFF(keeper->t_connect);
 	EVENT_OFF(keeper->t_delayopen);
@@ -739,9 +740,9 @@ static void bgp_graceful_restart_timer_expire(struct event *thread)
 	afi_t afi;
 	safi_t safi;
 
-	if (bgp_debug_neighbor_events(peer)) {
-		zlog_debug("%pBP graceful restart timer expired", peer);
-		zlog_debug("%pBP graceful restart stalepath timer stopped",
+	if (peer) {
+		zlog_info("%pBP graceful restart timer expired", peer);
+		zlog_info("%pBP graceful restart stalepath timer stopped",
 			   peer);
 	}
 
@@ -801,8 +802,8 @@ static void bgp_graceful_stale_timer_expire(struct event *thread)
 	afi_t afi;
 	safi_t safi;
 
-	if (bgp_debug_neighbor_events(peer))
-		zlog_debug("%pBP graceful restart stalepath timer expired",
+	if (peer)
+		zlog_info("%pBP graceful restart stalepath timer expired",
 			   peer);
 
 	/* NSF delete stale route */
@@ -1380,20 +1381,17 @@ enum bgp_fsm_state_progress bgp_stop(struct peer_connection *connection)
 		/* graceful restart */
 		if (connection->t_gr_stale) {
 			EVENT_OFF(connection->t_gr_stale);
-			if (bgp_debug_neighbor_events(peer))
-				zlog_debug(
+				zlog_info(
 					"%pBP graceful restart stalepath timer stopped",
 					peer);
 		}
 		if (CHECK_FLAG(peer->sflags, PEER_STATUS_NSF_WAIT)) {
-			if (bgp_debug_neighbor_events(peer)) {
-				zlog_debug(
-					"%pBP graceful restart timer started for %d sec",
-					peer, peer->v_gr_restart);
-				zlog_debug(
-					"%pBP graceful restart stalepath timer started for %d sec",
-					peer, peer->bgp->stalepath_time);
-			}
+			zlog_info(
+				"%pBP graceful restart timer started for %d sec",
+				peer, peer->v_gr_restart);
+			zlog_info(
+				"%pBP graceful restart stalepath timer started for %d sec",
+				peer, peer->bgp->stalepath_time);
 			BGP_TIMER_ON(connection->t_gr_restart,
 				     bgp_graceful_restart_timer_expire,
 				     peer->v_gr_restart);
@@ -1474,6 +1472,8 @@ enum bgp_fsm_state_progress bgp_stop(struct peer_connection *connection)
 
 	EVENT_OFF(connection->t_connect_check_r);
 	EVENT_OFF(connection->t_connect_check_w);
+
+	EVENT_OFF(connection->t_stop_with_notify);
 
 	/* Stop all timers. */
 	EVENT_OFF(connection->t_start);
@@ -2216,8 +2216,7 @@ bgp_establish(struct peer_connection *connection)
 		UNSET_FLAG(peer->sflags, PEER_STATUS_NSF_MODE);
 		if (connection->t_gr_stale) {
 			EVENT_OFF(connection->t_gr_stale);
-			if (bgp_debug_neighbor_events(peer))
-				zlog_debug(
+			zlog_info(
 					"%pBP graceful restart stalepath timer stopped",
 					peer);
 		}
@@ -2225,8 +2224,7 @@ bgp_establish(struct peer_connection *connection)
 
 	if (connection->t_gr_restart) {
 		EVENT_OFF(connection->t_gr_restart);
-		if (bgp_debug_neighbor_events(peer))
-			zlog_debug("%pBP graceful restart timer stopped", peer);
+		zlog_info("%pBP graceful restart timer stopped", peer);
 	}
 
 	/* Reset uptime, turn on keepalives, send current table. */
@@ -3147,4 +3145,11 @@ void bgp_peer_gr_flags_update(struct peer *peer)
 				peer->host);
 		}
 	}
+}
+
+void bgp_event_stop_with_notify(struct event *event)
+{
+	struct peer_connection *connection = EVENT_ARG(event);
+
+	bgp_stop_with_notify(connection, BGP_NOTIFY_HOLD_ERR, 0);
 }

@@ -116,6 +116,16 @@ enum dplane_op_e {
 	DPLANE_OP_NH_UPDATE,
 	DPLANE_OP_NH_DELETE,
 
+	/* Pic Context update*/
+	DPLANE_OP_PIC_CONTEXT_INSTALL,
+	DPLANE_OP_PIC_CONTEXT_UPDATE,
+	DPLANE_OP_PIC_CONTEXT_DELETE,
+
+	/* sid list update */
+	DPLANE_OP_SID_LIST_INSTALL,
+	DPLANE_OP_SID_LIST_UPDATE,
+	DPLANE_OP_SID_LIST_DELETE,
+
 	/* LSP update */
 	DPLANE_OP_LSP_INSTALL,
 	DPLANE_OP_LSP_UPDATE,
@@ -315,6 +325,8 @@ struct zebra_dplane_ctx *dplane_ctx_get_head(struct dplane_ctx_list_head *q);
 
 /* Init a list of contexts */
 void dplane_ctx_q_init(struct dplane_ctx_list_head *q);
+
+uint32_t dplane_ctx_queue_count(struct dplane_ctx_list_head *q);
 
 /*
  * Accessors for information from the context object
@@ -557,6 +569,9 @@ const struct nexthop_group *dplane_ctx_get_ng(
 const struct nexthop_group *dplane_ctx_get_old_ng(
 	const struct zebra_dplane_ctx *ctx);
 
+const struct zebra_srv6_sidlist *dplane_ctx_get_sidlist(const struct zebra_dplane_ctx *ctx);
+uint32_t dplane_ctx_get_pic_nhe_id(const struct zebra_dplane_ctx *ctx);
+
 /* Optional extra info about interfaces in nexthops - a plugin must enable
  * this extra info.
  */
@@ -588,7 +603,7 @@ const struct nexthop_group *
 dplane_ctx_get_nhe_ng(const struct zebra_dplane_ctx *ctx);
 const struct nh_grp *
 dplane_ctx_get_nhe_nh_grp(const struct zebra_dplane_ctx *ctx);
-uint8_t dplane_ctx_get_nhe_nh_grp_count(const struct zebra_dplane_ctx *ctx);
+uint16_t dplane_ctx_get_nhe_nh_grp_count(const struct zebra_dplane_ctx *ctx);
 
 /* Accessors for LSP information */
 

@@ -158,9 +158,13 @@ enum node_type {
 	PCEP_PCE_NODE,		 /* PCE configuration node */
 	PCEP_PCC_NODE,		 /* PCC configuration node */
 	SRV6_NODE,		 /* SRv6 node */
+	SRV6_SIDS_NODE,		 /* SRv6 SIDs node */
 	SRV6_LOCS_NODE,		 /* SRv6 locators node */
 	SRV6_LOC_NODE,		 /* SRv6 locator node */
 	SRV6_ENCAP_NODE,		 /* SRv6 encapsulation node */
+	SRV6_SID_FORMATS_NODE,		 /* SRv6 SID formats config node */
+	SRV6_SID_FORMAT_USID_F3216_NODE,		 /* SRv6 uSID f3216 format config node */
+	SRV6_SID_FORMAT_UNCOMPRESSED_F4024_NODE,		 /* SRv6 uncompressed f4024 format config node */
 	VTY_NODE,		 /* Vty node. */
 	FPM_NODE,		 /* Dataplane FPM node. */
 	LINK_PARAMS_NODE,	/* Link-parameters node */
@@ -179,6 +183,8 @@ enum node_type {
 	ISIS_SRV6_NODE_MSD_NODE,    /* ISIS SRv6 Node MSDs node */
 	MGMTD_NODE,		 /* MGMTD node. */
 	RPKI_VRF_NODE,  /* RPKI node for VRF */
+	PIM_NODE,		 /* PIM protocol mode */
+	PIM6_NODE,		 /* PIM protocol for IPv6 mode */
 	NODE_TYPE_MAX, /* maximum */
 };
 /* clang-format on */
@@ -246,6 +252,8 @@ struct cmd_node {
 
 /* Argc max counts. */
 #define CMD_ARGC_MAX   256
+
+/* clang-format off */
 
 /* helper defines for end-user DEFUN* macros */
 #define DEFUN_CMD_ELEMENT(funcname, cmdname, cmdstr, helpstr, attrs, dnum)     \
@@ -370,6 +378,8 @@ struct cmd_node {
 
 #define ALIAS_YANG(funcname, cmdname, cmdstr, helpstr)                         \
 	ALIAS_ATTR(funcname, cmdname, cmdstr, helpstr, CMD_ATTR_YANG)
+
+/* clang-format on */
 
 /* Some macroes */
 

@@ -385,6 +385,31 @@ static inline int proto2zebra(int proto, int family, bool is_nexthop)
 	return proto;
 }
 
+static uint32_t table_lookup_by_vrf(vrf_id_t vrf_id, ns_id_t ns_id)
+{
+	struct vrf *vrf;
+	struct zebra_vrf *zvrf;
+
+	RB_FOREACH (vrf, vrf_id_head, &vrfs_by_id) {
+		zvrf = vrf->info;
+		if (zvrf == NULL)
+			continue;
+		/* case vrf with netns : match the netnsid */
+		if (vrf_is_backend_netns()) {
+			if (ns_id == zvrf_id(zvrf))
+                return zvrf->table_id;
+		} else {
+			/* VRF is VRF_BACKEND_VRF_LITE */
+			if (zvrf_id(zvrf) != vrf_id)
+				continue;
+            return zvrf->table_id;
+		}
+	}
+
+	return RT_TABLE_UNSPEC;
+}
+
+
 /**
  * @parse_encap_mpls() - Parses encapsulated mpls attributes
  * @tb:         Pointer to rtattr to look for nested items in.
@@ -591,12 +616,9 @@ parse_nexthop_unicast(ns_id_t ns_id, struct rtmsg *rtm, struct rtattr **tb,
 	return nh;
 }
 
-static uint8_t parse_multipath_nexthops_unicast(ns_id_t ns_id,
-						struct nexthop_group *ng,
-						struct rtmsg *rtm,
-						struct rtnexthop *rtnh,
-						struct rtattr **tb,
-						void *prefsrc, vrf_id_t vrf_id)
+static uint16_t parse_multipath_nexthops_unicast(ns_id_t ns_id, struct nexthop_group *ng,
+						 struct rtmsg *rtm, struct rtnexthop *rtnh,
+						 struct rtattr **tb, void *prefsrc, vrf_id_t vrf_id)
 {
 	void *gate = NULL;
 	struct interface *ifp = NULL;
@@ -721,7 +743,7 @@ static uint8_t parse_multipath_nexthops_unicast(ns_id_t ns_id,
 		rtnh = RTNH_NEXT(rtnh);
 	}
 
-	uint8_t nhop_num = nexthop_group_nexthop_num(ng);
+	uint16_t nhop_num = nexthop_group_nexthop_num(ng);
 
 	return nhop_num;
 }
@@ -817,14 +839,26 @@ int netlink_route_change_read_unicast_internal(struct nlmsghdr *h,
 	if (rtm->rtm_family == AF_MPLS)
 		return 0;
 
-	/* Table corresponding to route. */
-	if (tb[RTA_TABLE])
-		table = *(int *)RTA_DATA(tb[RTA_TABLE]);
-	else
-		table = rtm->rtm_table;
+	if (!ctx) {
+		/* Table corresponding to route. */
+		if (tb[RTA_TABLE])
+			table = *(int *)RTA_DATA(tb[RTA_TABLE]);
+		else
+			table = rtm->rtm_table;
 
-	/* Map to VRF */
-	vrf_id = zebra_vrf_lookup_by_table(table, ns_id);
+		/* Map to VRF */
+		vrf_id = zebra_vrf_lookup_by_table(table, ns_id);
+	} else {
+		/* With FPM, rtm_table contains vrf id, see netlink_route_multipath_msg_encode */
+		if (tb[RTA_TABLE])
+			vrf_id = *(int *)RTA_DATA(tb[RTA_TABLE]);
+		else
+			vrf_id = rtm->rtm_table;
+
+		/* Map to table */
+		table = table_lookup_by_vrf(vrf_id, ns_id);
+	}
+
 	if (vrf_id == VRF_DEFAULT) {
 		if (!is_zebra_valid_kernel_table(table)
 		    && !is_zebra_main_routing_table(table))
@@ -1002,7 +1036,7 @@ int netlink_route_change_read_unicast_internal(struct nlmsghdr *h,
 				(struct rtnexthop *)RTA_DATA(tb[RTA_MULTIPATH]);
 
 			if (!nhe_id) {
-				uint8_t nhop_num;
+				uint16_t nhop_num;
 
 				/* Use temporary list of nexthops; parse
 				 * message payload's nexthops.
@@ -1882,6 +1916,50 @@ static inline bool _netlink_set_tag(struct nlmsghdr *n, unsigned int maxlen,
 	return true;
 }
 
+/*
+ * The function returns true if the attribute could be added
+ * to the message, otherwise false is returned.
+ */
+static int netlink_route_nexthop_encap(bool fpm, struct nlmsghdr *n,
+				       size_t nlen, const struct nexthop *nh)
+{
+	struct rtattr *nest;
+	struct vxlan_nh_encap* encap_data;
+
+	if (!fpm)
+		return true;
+
+	switch (nh->nh_encap_type) {
+	case NET_VXLAN:
+		if (!nl_attr_put16(n, nlen, RTA_ENCAP_TYPE, nh->nh_encap_type))
+			return false;
+
+		nest = nl_attr_nest(n, nlen, RTA_ENCAP);
+		if (!nest)
+			return false;
+
+		encap_data = &nh->nh_encap.encap_data;
+
+		if (!nl_attr_put32(n, nlen, 0 /* VXLAN_VNI */,
+				   encap_data->vni))
+			return false;
+
+		if (ZEBRA_DEBUG_KERNEL)
+			zlog_debug(
+				"%s: VNI:%d RMAC:%pEA", __func__, encap_data->vni,
+				&encap_data->rmac);
+
+		if (!nl_attr_put(n, nlen, 1 /* VXLAN_RMAC */,
+					&encap_data->rmac, sizeof(encap_data->rmac)))
+			return false;
+
+		nl_attr_nest_end(n, nest);
+		break;
+	}
+
+	return true;
+}
+
 /* This function takes a nexthop as argument and
  * appends to the given netlink msg. If the nexthop
  * defines a preferred source, the src parameter
@@ -1900,10 +1978,13 @@ static inline bool _netlink_set_tag(struct nlmsghdr *n, unsigned int maxlen,
  * The function returns true if the nexthop could be added
  * to the message, otherwise false is returned.
  */
-static bool _netlink_route_build_multipath(
-	const struct prefix *p, const char *routedesc, int bytelen,
-	const struct nexthop *nexthop, struct nlmsghdr *nlmsg, size_t req_size,
-	struct rtmsg *rtmsg, const union g_addr **src, route_tag_t tag)
+static bool _netlink_route_build_multipath(const struct prefix *p,
+					   const char *routedesc, int bytelen,
+					   const struct nexthop *nexthop,
+					   struct nlmsghdr *nlmsg,
+					   size_t req_size, struct rtmsg *rtmsg,
+					   const union g_addr **src,
+					   route_tag_t tag, bool fpm)
 {
 	char label_buf[256];
 	struct vrf *vrf;
@@ -2011,6 +2092,13 @@ static bool _netlink_route_build_multipath(
 	if (!_netlink_set_tag(nlmsg, req_size, tag))
 		return false;
 
+	/*
+	 * Add encapsulation information when installing via
+	 * FPM.
+	 */
+	if (!netlink_route_nexthop_encap(fpm, nlmsg, req_size, nexthop))
+		return false;
+
 	nl_attr_rtnh_end(nlmsg, rtnh);
 	return true;
 }
@@ -2045,7 +2133,7 @@ _netlink_mpls_build_multipath(const struct prefix *p, const char *routedesc,
 	bytelen = (family == AF_INET ? 4 : 16);
 	return _netlink_route_build_multipath(p, routedesc, bytelen,
 					      nhlfe->nexthop, nlmsg, req_size,
-					      rtmsg, src, 0);
+					      rtmsg, src, 0, false);
 }
 
 static void _netlink_mpls_debug(int cmd, uint32_t label, const char *routedesc)
@@ -2141,34 +2229,6 @@ static bool nexthop_set_src(const struct nexthop *nexthop, int family,
 }
 
 /*
- * The function returns true if the attribute could be added
- * to the message, otherwise false is returned.
- */
-static int netlink_route_nexthop_encap(struct nlmsghdr *n, size_t nlen,
-				       struct nexthop *nh)
-{
-	struct rtattr *nest;
-
-	switch (nh->nh_encap_type) {
-	case NET_VXLAN:
-		if (!nl_attr_put16(n, nlen, RTA_ENCAP_TYPE, nh->nh_encap_type))
-			return false;
-
-		nest = nl_attr_nest(n, nlen, RTA_ENCAP);
-		if (!nest)
-			return false;
-
-		if (!nl_attr_put32(n, nlen, 0 /* VXLAN_VNI */,
-				   nh->nh_encap.vni))
-			return false;
-		nl_attr_nest_end(n, nest);
-		break;
-	}
-
-	return true;
-}
-
-/*
  * Routing table change via netlink interface, using a dataplane context object
  *
  * Returns -1 on failure, 0 when the msg doesn't fit entirely in the buffer
@@ -2257,10 +2317,28 @@ ssize_t netlink_route_multipath_msg_encode(int cmd, struct zebra_dplane_ctx *ctx
 	 * path(s)
 	 * by the routing protocol and for communicating with protocol peers.
 	 */
-	if (!nl_attr_put32(&req->n, datalen, RTA_PRIORITY,
-			   ROUTE_INSTALLATION_METRIC))
+	if (fpm)
+	{
+            /* Patch to send tag value as route attribute using RTA_PRIORITY
+	     * which can be used as metadata/attribute to take application specific
+	     * action. As seen in above comment this field is not use anyways and can be
+	     * use by fpmsyncd */
+            if (!nl_attr_put32(&req->n, datalen, RTA_PRIORITY,
+		               cmd == RTM_DELROUTE ? dplane_ctx_get_old_tag(ctx) :
+				                     dplane_ctx_get_tag(ctx)))
+	    {
 		return 0;
 
+	    }
+	}
+	else
+	{
+	    if (!nl_attr_put32(&req->n, datalen, RTA_PRIORITY,
+			       ROUTE_INSTALLATION_METRIC))
+	    {
+                return 0;
+	    }
+	}
 #if defined(SUPPORT_REALMS)
 	if (cmd == RTM_DELROUTE)
 		tag = dplane_ctx_get_old_tag(ctx);
@@ -2270,12 +2348,24 @@ ssize_t netlink_route_multipath_msg_encode(int cmd, struct zebra_dplane_ctx *ctx
 
 	/* Table corresponding to this route. */
 	table_id = dplane_ctx_get_table(ctx);
-	if (table_id < 256)
-		req->r.rtm_table = table_id;
-	else {
-		req->r.rtm_table = RT_TABLE_UNSPEC;
-		if (!nl_attr_put32(&req->n, datalen, RTA_TABLE, table_id))
-			return 0;
+	if (!fpm) {
+		if (table_id < 256)
+			req->r.rtm_table = table_id;
+		else {
+			req->r.rtm_table = RT_TABLE_UNSPEC;
+			if (!nl_attr_put32(&req->n, datalen, RTA_TABLE, table_id))
+				return 0;
+		}
+	} else {
+		/* Put vrf if_index instead of table id */
+		vrf_id_t vrf = dplane_ctx_get_vrf(ctx);
+		if (vrf < 256)
+			req->r.rtm_table = vrf;
+		else {
+			req->r.rtm_table = RT_TABLE_UNSPEC;
+			if (!nl_attr_put32(&req->n, datalen, RTA_TABLE, vrf))
+				return 0;
+		}
 	}
 
 	if (IS_ZEBRA_DEBUG_KERNEL)
@@ -2422,12 +2512,10 @@ ssize_t netlink_route_multipath_msg_encode(int cmd, struct zebra_dplane_ctx *ctx
 				 * Add encapsulation information when
 				 * installing via FPM.
 				 */
-				if (fpm) {
-					if (!netlink_route_nexthop_encap(&req->n,
-									 datalen,
-									 nexthop))
-						return 0;
-				}
+				if (!netlink_route_nexthop_encap(fpm, &req->n,
+								 datalen,
+								 nexthop))
+					return 0;
 
 				nexthop_num++;
 				break;
@@ -2472,21 +2560,15 @@ ssize_t netlink_route_multipath_msg_encode(int cmd, struct zebra_dplane_ctx *ctx
 						    : "multipath";
 				nexthop_num++;
 
-				if (!_netlink_route_build_multipath(
-					    p, routedesc, bytelen, nexthop,
-					    &req->n, datalen, &req->r, &src1,
-					    tag))
+				if (!_netlink_route_build_multipath(p, routedesc,
+								    bytelen,
+								    nexthop,
+								    &req->n,
+								    datalen,
+								    &req->r,
+								    &src1, tag,
+								    fpm))
 					return 0;
-
-				/*
-				 * Add encapsulation information when installing via
-				 * FPM.
-				 */
-				if (fpm) {
-					if (!netlink_route_nexthop_encap(
-						    &req->n, datalen, nexthop))
-						return 0;
-				}
 
 				if (!setsrc && src1) {
 					if (p->family == AF_INET)
@@ -2605,11 +2687,9 @@ int kernel_get_ipmr_sg_stats(struct zebra_vrf *zvrf, void *in)
 /* Char length to debug ID with */
 #define ID_LENGTH 10
 
-static bool _netlink_nexthop_build_group(struct nlmsghdr *n, size_t req_size,
-					 uint32_t id,
-					 const struct nh_grp *z_grp,
-					 const uint8_t count, bool resilient,
-					 const struct nhg_resilience *nhgr)
+static bool _netlink_nexthop_build_group(struct nlmsghdr *n, size_t req_size, uint32_t id,
+					 const struct nh_grp *z_grp, const uint16_t count,
+					 bool resilient, const struct nhg_resilience *nhgr)
 {
 	struct nexthop_grp grp[count];
 	/* Need space for max group size, "/", and null term */
@@ -3234,7 +3314,7 @@ static int netlink_nexthop_process_group(struct rtattr **tb,
 					 struct nh_grp *z_grp, int z_grp_size,
 					 struct nhg_resilience *nhgr)
 {
-	uint8_t count = 0;
+	uint16_t count = 0;
 	/* linux/nexthop.h group struct */
 	struct nexthop_grp *n_grp = NULL;
 
@@ -3307,7 +3387,7 @@ int netlink_nexthop_change(struct nlmsghdr *h, ns_id_t ns_id, int startup)
 	struct nexthop nh = {};
 	struct nh_grp grp[MULTIPATH_NUM] = {};
 	/* Count of nexthops in group array */
-	uint8_t grp_count = 0;
+	uint16_t grp_count = 0;
 	struct rtattr *tb[NHA_MAX + 1] = {};
 
 	frrtrace(3, frr_zebra, netlink_nexthop_change, h, ns_id, startup);

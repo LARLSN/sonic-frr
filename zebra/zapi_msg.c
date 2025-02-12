@@ -517,7 +517,7 @@ int zsend_redistribute_route(int cmd, struct zserv *client,
 	struct zapi_nexthop *api_nh;
 	struct nexthop *nexthop;
 	const struct prefix *p, *src_p;
-	uint8_t count = 0;
+	uint16_t count = 0;
 	afi_t afi;
 	size_t stream_size =
 		MAX(ZEBRA_MAX_PACKET_SIZ, sizeof(struct zapi_route));
@@ -647,7 +647,7 @@ static int zsend_nexthop_lookup_mrib(struct zserv *client, struct ipaddr *addr,
 {
 	struct stream *s;
 	unsigned long nump;
-	uint8_t num;
+	uint16_t num;
 	struct nexthop *nexthop;
 
 	/* Get output stream. */
@@ -667,7 +667,7 @@ static int zsend_nexthop_lookup_mrib(struct zserv *client, struct ipaddr *addr,
 		/* remember position for nexthop_num */
 		nump = stream_get_endp(s);
 		/* reserve room for nexthop_num */
-		stream_putc(s, 0);
+		stream_putw(s, 0);
 		nhg = rib_get_fib_nhg(re);
 		for (ALL_NEXTHOPS_PTR(nhg, nexthop)) {
 			if (rnh_nexthop_valid(re, nexthop))
@@ -675,11 +675,11 @@ static int zsend_nexthop_lookup_mrib(struct zserv *client, struct ipaddr *addr,
 		}
 
 		/* store nexthop_num */
-		stream_putc_at(s, nump, num);
+		stream_putw_at(s, nump, num);
 	} else {
 		stream_putc(s, 0); /* distance */
 		stream_putl(s, 0); /* metric */
-		stream_putc(s, 0); /* nexthop_num */
+		stream_putw(s, 0); /* nexthop_num */
 	}
 
 	stream_putw_at(s, 0, stream_get_endp(s));
@@ -999,6 +999,48 @@ void zsend_neighbor_notify(int cmd, struct interface *ifp,
 	}
 }
 
+void zsend_srv6_sid_notify(struct zserv *client, const struct srv6_sid_ctx *ctx,
+			   struct in6_addr *sid_value, uint32_t func,
+			   uint32_t wide_func, const char *locator_name,
+			   enum zapi_srv6_sid_notify note)
+
+{
+	struct stream *s;
+	uint16_t cmd = ZEBRA_SRV6_SID_NOTIFY;
+	char buf[256];
+
+	if (IS_ZEBRA_DEBUG_PACKET)
+		zlog_debug("%s: notifying %s ctx %s sid %pI6 note %s (proto=%u, instance=%u, sessionId=%u)",
+			   __func__, zserv_command_string(cmd),
+			   srv6_sid_ctx2str(buf, sizeof(buf), ctx), sid_value,
+			   zapi_srv6_sid_notify2str(note), client->proto,
+			   client->instance, client->session_id);
+
+	s = stream_new(ZEBRA_MAX_PACKET_SIZ);
+
+	zclient_create_header(s, cmd, VRF_DEFAULT);
+	/* Notification type (e.g. ZAPI_SRV6_SID_ALLOCATED, ZAPI_SRV6_SID_FAIL_ALLOC, ...) */
+	stream_put(s, &note, sizeof(note));
+	/* Context associated with the SRv6 SID */
+	stream_put(s, ctx, sizeof(struct srv6_sid_ctx));
+	/* SRv6 SID value (i.e. IPv6 address) */
+	stream_put(s, sid_value, sizeof(struct in6_addr));
+	/* SRv6 SID function */
+	stream_putl(s, func);
+	/* SRv6 wide SID function */
+	stream_putl(s, wide_func);
+	/* SRv6 locator name optional */
+	if (locator_name) {
+		stream_putw(s, strlen(locator_name));
+		stream_put(s, locator_name, strlen(locator_name));
+	} else
+		stream_putw(s, 0);
+
+	stream_putw_at(s, 0, stream_get_endp(s));
+
+	zserv_send_message(client, s);
+}
+
 
 /* Router-id is updated. Send ZEBRA_ROUTER_ID_UPDATE to client. */
 int zsend_router_id_update(struct zserv *client, afi_t afi, struct prefix *p,
@@ -1136,9 +1178,25 @@ static int zsend_table_manager_connect_response(struct zserv *client,
 int zsend_zebra_srv6_locator_add(struct zserv *client, struct srv6_locator *loc)
 {
 	struct stream *s = stream_new(ZEBRA_MAX_PACKET_SIZ);
+	struct srv6_locator locator = {};
+	struct srv6_sid_format *format = loc->sid_format;
+
+	/*
+	 * Copy the locator and fill locator block/node/func/arg length from the format
+	 * before sending the locator to the zclient
+	 */
+	srv6_locator_copy(&locator, loc);
+	if (format) {
+		locator.block_bits_length = format->block_len;
+		locator.node_bits_length = format->node_len;
+		locator.function_bits_length = format->function_len;
+		locator.argument_bits_length = format->argument_len;
+		if (format->type == SRV6_SID_FORMAT_TYPE_USID)
+			SET_FLAG(locator.flags, SRV6_LOCATOR_USID);
+	}
 
 	zclient_create_header(s, ZEBRA_SRV6_LOCATOR_ADD, VRF_DEFAULT);
-	zapi_srv6_locator_encode(s, loc);
+	zapi_srv6_locator_encode(s, &locator);
 	stream_putw_at(s, 0, stream_get_endp(s));
 
 	return zserv_send_message(client, s);
@@ -1583,6 +1641,8 @@ static struct nexthop *nexthop_from_zapi(const struct zapi_nexthop *api_nh,
 		 * the nexthop and associated MAC need to be installed.
 		 */
 		if (CHECK_FLAG(api_nh->flags, ZAPI_NEXTHOP_FLAG_EVPN)) {
+			memcpy(&(nexthop->nh_encap.encap_data.rmac),
+				   &api_nh->rmac, ETH_ALEN);
 			SET_FLAG(nexthop->flags, NEXTHOP_FLAG_EVPN);
 			nexthop->rmac = api_nh->rmac;
 		}
@@ -1612,6 +1672,8 @@ static struct nexthop *nexthop_from_zapi(const struct zapi_nexthop *api_nh,
 		 * the nexthop and associated MAC need to be installed.
 		 */
 		if (CHECK_FLAG(api_nh->flags, ZAPI_NEXTHOP_FLAG_EVPN)) {
+			memcpy(&(nexthop->nh_encap.encap_data.rmac),
+				   &api_nh->rmac, ETH_ALEN);
 			SET_FLAG(nexthop->flags, NEXTHOP_FLAG_EVPN);
 			nexthop->rmac = api_nh->rmac;
 		}
@@ -2991,6 +3053,96 @@ stream_failure:
 	return;
 }
 
+/**
+ * Handle SRv6 SID request received from a client daemon protocol.
+ *
+ * @param client The client zapi session
+ * @param msg The request message
+ */
+static void zread_srv6_manager_get_srv6_sid(struct zserv *client,
+					    struct stream *msg)
+{
+	struct stream *s;
+	struct srv6_sid_ctx ctx = {};
+	struct in6_addr sid_value = {};
+	struct in6_addr *sid_value_ptr = NULL;
+	char locator[SRV6_LOCNAME_SIZE] = { 0 };
+	uint16_t len;
+	struct zebra_srv6_sid *sid = NULL;
+	uint8_t flags;
+
+	/* Get input stream */
+	s = msg;
+
+	/* Get data */
+	STREAM_GET(&ctx, s, sizeof(struct srv6_sid_ctx));
+	STREAM_GETC(s, flags);
+	if (CHECK_FLAG(flags, ZAPI_SRV6_MANAGER_SID_FLAG_HAS_SID_VALUE)) {
+		STREAM_GET(&sid_value, s, sizeof(struct in6_addr));
+		sid_value_ptr = &sid_value;
+	}
+	if (CHECK_FLAG(flags, ZAPI_SRV6_MANAGER_SID_FLAG_HAS_LOCATOR)) {
+		STREAM_GETW(s, len);
+		STREAM_GET(locator, s, len);
+	}
+
+	/* Call hook to get a SID using wrapper */
+	srv6_manager_get_sid_call(&sid, client, &ctx, sid_value_ptr, locator);
+
+stream_failure:
+	return;
+}
+
+/**
+ * Handle SRv6 SID release request received from a client daemon protocol.
+ *
+ * @param client The client zapi session
+ * @param msg The request message
+ */
+static void zread_srv6_manager_release_srv6_sid(struct zserv *client,
+						struct stream *msg)
+{
+	struct stream *s;
+	struct srv6_sid_ctx ctx = {};
+
+	/* Get input stream */
+	s = msg;
+
+	/* Get data */
+	STREAM_GET(&ctx, s, sizeof(struct srv6_sid_ctx));
+
+	/* Call hook to release a SID using wrapper */
+	srv6_manager_release_sid_call(client, &ctx);
+
+stream_failure:
+	return;
+}
+
+/**
+ * Handle SRv6 locator get request received from a client daemon protocol.
+ *
+ * @param client The client zapi session
+ * @param msg The request message
+ */
+static void zread_srv6_manager_get_locator(struct zserv *client,
+					   struct stream *msg)
+{
+	struct stream *s = msg;
+	uint16_t len;
+	char locator_name[SRV6_LOCNAME_SIZE] = { 0 };
+	struct srv6_locator *locator = NULL;
+
+	/* Get data */
+	STREAM_GETW(s, len);
+	STREAM_GET(locator_name, s, len);
+
+	/* Call hook to get the locator info using wrapper */
+	srv6_manager_get_locator_call(&locator, client, locator_name);
+
+stream_failure:
+	return;
+}
+
 static void zread_srv6_manager_request(ZAPI_HANDLER_ARGS)
 {
 	switch (hdr->command) {
@@ -3001,6 +3153,15 @@ static void zread_srv6_manager_request(ZAPI_HANDLER_ARGS)
 	case ZEBRA_SRV6_MANAGER_RELEASE_LOCATOR_CHUNK:
 		zread_srv6_manager_release_locator_chunk(client, msg,
 							 zvrf_id(zvrf));
+		break;
+	case ZEBRA_SRV6_MANAGER_GET_SRV6_SID:
+		zread_srv6_manager_get_srv6_sid(client, msg);
+		break;
+	case ZEBRA_SRV6_MANAGER_RELEASE_SRV6_SID:
+		zread_srv6_manager_release_srv6_sid(client, msg);
+		break;
+	case ZEBRA_SRV6_MANAGER_GET_LOCATOR:
+		zread_srv6_manager_get_locator(client, msg);
 		break;
 	default:
 		zlog_err("%s: unknown SRv6 Manager command", __func__);
@@ -3950,6 +4111,9 @@ void (*const zserv_handlers[])(ZAPI_HANDLER_ARGS) = {
 	[ZEBRA_MLAG_FORWARD_MSG] = zebra_mlag_forward_client_msg,
 	[ZEBRA_SRV6_MANAGER_GET_LOCATOR_CHUNK] = zread_srv6_manager_request,
 	[ZEBRA_SRV6_MANAGER_RELEASE_LOCATOR_CHUNK] = zread_srv6_manager_request,
+	[ZEBRA_SRV6_MANAGER_GET_SRV6_SID] = zread_srv6_manager_request,
+	[ZEBRA_SRV6_MANAGER_RELEASE_SRV6_SID] = zread_srv6_manager_request,
+	[ZEBRA_SRV6_MANAGER_GET_LOCATOR] = zread_srv6_manager_request,
 	[ZEBRA_CLIENT_CAPABILITIES] = zread_client_capabilities,
 	[ZEBRA_NEIGH_DISCOVER] = zread_neigh_discover,
 	[ZEBRA_NHG_ADD] = zread_nhg_add,

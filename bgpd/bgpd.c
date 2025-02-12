@@ -461,6 +461,10 @@ void bgp_suppress_fib_pending_set(struct bgp *bgp, bool set)
 	if (bgp->inst_type == BGP_INSTANCE_TYPE_VIEW)
 		return;
 
+	/* Do nothing if already in a desired state */
+	if (set == !!CHECK_FLAG(bgp->flags, BGP_FLAG_SUPPRESS_FIB_PENDING))
+		return;
+
 	if (set) {
 		SET_FLAG(bgp->flags, BGP_FLAG_SUPPRESS_FIB_PENDING);
 		/* Send msg to zebra for the first instance of bgp enabled
@@ -1474,9 +1478,11 @@ static void bgp_srv6_init(struct bgp *bgp)
 static void bgp_srv6_cleanup(struct bgp *bgp)
 {
 	for (afi_t afi = AFI_IP; afi < AFI_MAX; afi++) {
-		if (bgp->vpn_policy[afi].tovpn_sid_locator != NULL)
-			srv6_locator_chunk_free(
-				&bgp->vpn_policy[afi].tovpn_sid_locator);
+		if (bgp->vpn_policy[afi].tovpn_sid_locator != NULL) {
+			srv6_locator_free(
+				bgp->vpn_policy[afi].tovpn_sid_locator);
+			bgp->vpn_policy[afi].tovpn_sid_locator = NULL;
+		}
 		if (bgp->vpn_policy[afi].tovpn_zebra_vrf_sid_last_sent != NULL)
 			XFREE(MTYPE_BGP_SRV6_SID,
 			      bgp->vpn_policy[afi].tovpn_zebra_vrf_sid_last_sent);
@@ -1487,8 +1493,10 @@ static void bgp_srv6_cleanup(struct bgp *bgp)
 		}
 	}
 
-	if (bgp->tovpn_sid_locator != NULL)
-		srv6_locator_chunk_free(&bgp->tovpn_sid_locator);
+	if (bgp->tovpn_sid_locator != NULL) {
+		srv6_locator_free(bgp->tovpn_sid_locator);
+		bgp->tovpn_sid_locator = NULL;
+	}
 	if (bgp->tovpn_zebra_vrf_sid_last_sent != NULL)
 		XFREE(MTYPE_BGP_SRV6_SID, bgp->tovpn_zebra_vrf_sid_last_sent);
 	if (bgp->tovpn_sid != NULL) {
@@ -1500,6 +1508,9 @@ static void bgp_srv6_cleanup(struct bgp *bgp)
 		list_delete(&bgp->srv6_locator_chunks);
 	if (bgp->srv6_functions)
 		list_delete(&bgp->srv6_functions);
+
+	srv6_locator_free(bgp->srv6_locator);
+	bgp->srv6_locator = NULL;
 }
 
 /* Allocate new peer object, implicitely locked.  */
@@ -1869,21 +1880,31 @@ void bgp_peer_conf_if_to_su_update(struct peer_connection *connection)
 void bgp_recalculate_afi_safi_bestpaths(struct bgp *bgp, afi_t afi, safi_t safi)
 {
 	struct bgp_dest *dest, *ndest;
+	struct bgp_path_info *pi, *next;
 	struct bgp_table *table;
 
 	for (dest = bgp_table_top(bgp->rib[afi][safi]); dest;
 	     dest = bgp_route_next(dest)) {
 		table = bgp_dest_get_bgp_table_info(dest);
-		if (table != NULL) {
-			/* Special handling for 2-level routing
-			 * tables. */
-			if (safi == SAFI_MPLS_VPN || safi == SAFI_ENCAP
-			    || safi == SAFI_EVPN) {
-				for (ndest = bgp_table_top(table); ndest;
-				     ndest = bgp_route_next(ndest))
-					bgp_process(bgp, ndest, afi, safi);
-			} else
-				bgp_process(bgp, dest, afi, safi);
+
+		if (!table)
+			continue;
+
+		/* Special handling for 2-level routing
+		 * tables. */
+		if (safi == SAFI_MPLS_VPN || safi == SAFI_ENCAP
+		    || safi == SAFI_EVPN) {
+			for (ndest = bgp_table_top(table); ndest;
+			     ndest = bgp_route_next(ndest)) {
+				for (pi = bgp_dest_get_bgp_path_info(ndest);
+				     (pi != NULL) && (next = pi->next, 1);
+				     pi = next)
+					bgp_process(bgp, ndest, pi, afi, safi);
+			}
+		} else {
+			for (pi = bgp_dest_get_bgp_path_info(dest);
+			     (pi != NULL) && (next = pi->next, 1); pi = next)
+				bgp_process(bgp, dest, pi, afi, safi);
 		}
 	}
 }
@@ -2629,13 +2650,11 @@ void peer_nsf_stop(struct peer *peer)
 
 	if (peer->connection->t_gr_restart) {
 		EVENT_OFF(peer->connection->t_gr_restart);
-		if (bgp_debug_neighbor_events(peer))
-			zlog_debug("%pBP graceful restart timer stopped", peer);
+		zlog_info("%pBP graceful restart timer stopped", peer);
 	}
 	if (peer->connection->t_gr_stale) {
 		EVENT_OFF(peer->connection->t_gr_stale);
-		if (bgp_debug_neighbor_events(peer))
-			zlog_debug(
+		zlog_info(
 				"%pBP graceful restart stalepath timer stopped",
 				peer);
 	}
@@ -3869,9 +3888,34 @@ int bgp_delete(struct bgp *bgp)
 	afi_t afi;
 	safi_t safi;
 	int i;
+	struct bgp_dest *dest = NULL;
+	struct bgp_dest *dest_next = NULL;
+	struct bgp_table *dest_table = NULL;
 	struct graceful_restart_info *gr_info;
+	uint32_t cnt_before, cnt_after;
 
 	assert(bgp);
+
+	/*
+	 * Iterate the pending dest list and remove all the dest pertaininig to
+	 * the bgp under delete.
+	 */
+	cnt_before = zebra_announce_count(&bm->zebra_announce_head);
+	for (dest = zebra_announce_first(&bm->zebra_announce_head); dest;
+	     dest = dest_next) {
+		dest_next = zebra_announce_next(&bm->zebra_announce_head, dest);
+		dest_table = bgp_dest_table(dest);
+		if (dest_table->bgp == bgp) {
+			zebra_announce_del(&bm->zebra_announce_head, dest);
+			bgp_path_info_unlock(dest->za_bgp_pi);
+			bgp_dest_unlock_node(dest);
+		}
+	}
+
+	cnt_after = zebra_announce_count(&bm->zebra_announce_head);
+	if (BGP_DEBUG(zebra, ZEBRA))
+		zlog_debug("Zebra Announce Fifo cleanup count before %u and after %u during BGP %s deletion",
+			   cnt_before, cnt_after, bgp->name_pretty);
 
 	bgp_soft_reconfig_table_task_cancel(bgp, NULL, NULL);
 
@@ -8298,6 +8342,8 @@ void bgp_master_init(struct event_loop *master, const int buffer_size,
 	memset(&bgp_master, 0, sizeof(bgp_master));
 
 	bm = &bgp_master;
+
+	zebra_announce_init(&bm->zebra_announce_head);
 	bm->bgp = list_new();
 	bm->listen_sockets = list_new();
 	bm->port = BGP_PORT_DEFAULT;
@@ -8316,6 +8362,7 @@ void bgp_master_init(struct event_loop *master, const int buffer_size,
 	bm->outq_limit = BM_DEFAULT_Q_LIMIT;
 	bm->t_bgp_sync_label_manager = NULL;
 	bm->t_bgp_start_label_manager = NULL;
+	bm->t_bgp_zebra_route = NULL;
 
 	bgp_mac_init();
 	/* init the rd id space.
@@ -8566,6 +8613,7 @@ void bgp_terminate(void)
 	EVENT_OFF(bm->t_rmap_update);
 	EVENT_OFF(bm->t_bgp_sync_label_manager);
 	EVENT_OFF(bm->t_bgp_start_label_manager);
+	EVENT_OFF(bm->t_bgp_zebra_route);
 
 	bgp_mac_finish();
 }

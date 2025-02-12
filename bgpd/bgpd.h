@@ -18,6 +18,8 @@
 #include "iana_afi.h"
 #include "asn.h"
 
+PREDECL_LIST(zebra_announce);
+
 /* For union sockunion.  */
 #include "queue.h"
 #include "sockunion.h"
@@ -170,10 +172,15 @@ struct bgp_master {
 	uint32_t inq_limit;
 	uint32_t outq_limit;
 
+	struct event *t_bgp_zebra_route;
+
 	struct event *t_bgp_sync_label_manager;
 	struct event *t_bgp_start_label_manager;
 
 	bool v6_with_v4_nexthops;
+
+	/* To preserve ordering of installations into zebra across all Vrfs */
+	struct zebra_announce_head zebra_announce_head;
 
 	QOBJ_FIELDS;
 };
@@ -242,7 +249,7 @@ struct vpn_policy {
 	 */
 	uint32_t tovpn_sid_index; /* unset => set to 0 */
 	struct in6_addr *tovpn_sid;
-	struct srv6_locator_chunk *tovpn_sid_locator;
+	struct srv6_locator *tovpn_sid_locator;
 	uint32_t tovpn_sid_transpose_label;
 	struct in6_addr *tovpn_zebra_vrf_sid_last_sent;
 };
@@ -522,6 +529,7 @@ struct bgp {
 #define BGP_FLAG_LU_IPV6_EXPLICIT_NULL (1ULL << 34)
 #define BGP_FLAG_SOFT_VERSION_CAPABILITY (1ULL << 35)
 #define BGP_FLAG_ENFORCE_FIRST_AS (1ULL << 36)
+#define BGP_FLAG_VNI_DOWN (1ULL << 38)
 
 	/* BGP default address-families.
 	 * New peers inherit enabled afi/safis from bgp instance.
@@ -805,11 +813,12 @@ struct bgp {
 	/* BGP VPN SRv6 backend */
 	bool srv6_enabled;
 	char srv6_locator_name[SRV6_LOCNAME_SIZE];
+	struct srv6_locator *srv6_locator;
 	struct list *srv6_locator_chunks;
 	struct list *srv6_functions;
 	uint32_t tovpn_sid_index; /* unset => set to 0 */
 	struct in6_addr *tovpn_sid;
-	struct srv6_locator_chunk *tovpn_sid_locator;
+	struct srv6_locator *tovpn_sid_locator;
 	uint32_t tovpn_sid_transpose_label;
 	struct in6_addr *tovpn_zebra_vrf_sid_last_sent;
 
@@ -1180,6 +1189,8 @@ struct peer_connection {
 	struct event *t_routeadv;
 	struct event *t_process_packet;
 	struct event *t_process_packet_error;
+
+	struct event *t_stop_with_notify;
 
 	union sockunion su;
 #define BGP_CONNECTION_SU_UNSPEC(connection)                                   \
